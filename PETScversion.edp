@@ -1,0 +1,401 @@
+// Elise Grosjean
+//01/2023
+// Pump simulation: stokes-Biot-darcy coupling. Method as in "Partitioning strategies for the interaction of a fluid with a poroelastic material based on a Nitsche's coupling approach: monolithic approach"
+
+
+load "PETSc"
+load "msh3"
+load "gmsh"
+macro dimension()3// EOM
+include "macro_ddm.idp"
+
+real tgv=-1;
+
+real sqrt2=sqrt(2);
+int[int] Order=[1];
+
+macro Grad(u) [dx(u), dy(u), dz(u)]    //
+macro Div(ux, uy, uz) (dx(ux) + dy(uy) + dz(uz))    //
+macro ee(u1,u2,u3) [dx(u1),dy(u2),dz(u3),(dz(u2)+dy(u3))/sqrt2,(dz(u1)+dx(u3))/sqrt2,(dy(u1)+dx(u2))/sqrt2]  //
+
+//****************************** constants ***********************************//
+
+real t=0;//time
+real dt=0.5; //cfl dt<<Ch
+real E =2e6;//12e9; //Young Modulus for Cartilage (in Pa=kg.m-1.s-2 or g.mm-1.s-2)
+real nu=0.168;//0.45; //Poisson's ration
+
+real porosity=0.8;
+real Mup=E/(2*(1+nu)); //lame coeff = shear coefficient
+real lambdap = E*nu/((1+nu)*(1-2*nu)); //lame 2nd coefficient
+
+real rhof=1e-3;// density water
+real rhop=1e-3;// Poroelastic wall density
+real Mu = 1e-3;//dynamic viscosity (g.mm-1.s-1) //temp=20°C
+
+real K=1e-11;//200e-6;//permeability mm^2
+real gravity=-9.8e3;//mm/s²
+
+real c0=6.89e-5; //mass storativity mm s²/g
+real alpha=1;//biot willis constant
+real alphaBJS=alpha*Mu/sqrt(K);//beavers-Joseph-Saffman
+real gammastab=1000;// penalization
+
+//****************************** Domain ***********************************//
+int Bottom = 4000;	//Pipe wall label
+int Wall = 3000;	//Pipe wall label
+int Inlet = 1000;	//Pipe inlet label
+int Outlet = 2000;	//Pipe outlet label
+
+
+// ** Flow domain ** //
+mesh3 Th("Thtry.mesh");
+Th=change(Th,rmInternalFaces=true, rmlfaces=true);
+mesh3 ThGlobal=Th; //saving global mesh 
+
+int[int] n2oGlobal;
+macro ThN2O()n2oGlobal// EOM
+
+Mat A,B,C,D;// Globmat=[[A,B],[C,D]]
+
+func Pk=[RT03d,P0,P1,P1,P1,P1,P1,P1];
+func Uk=[P1b,P1b,P1b,P1];
+
+{
+fespace Ph(Th, P0);
+fespace XhScaffoldUnknowns(Th,Pk);
+fespace UhFlowUnknowns(Th,Uk);
+real[int] part(Ph.ndof);
+
+{
+int[int] new2oldF(1), new2oldS(1);
+Ph Cond=z>=1.80?2:0;
+
+mesh3 ThFLoc = trunc(Th,abs(Cond)>=1e-6,new2old = new2oldF);
+mesh3 ThScafLoc = trunc(Th,abs(Cond)<=1e-6, new2old = new2oldS);
+
+// ** Flow domain ** //
+func TestNewlabelf= (z<=1.800001)? 4000:label;//bottom - for darcy law
+ThFLoc=change(ThFLoc,flabel=TestNewlabelf);
+
+// ** Scaffold domain ** //
+func TestNewlabelwall= (label==3000)? 8000:label; //top - darcy law
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabelwall);
+func TestNewlabell= (z>=1.7999999 && label!=8000)? 5000:label;
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabell);
+
+/*func TestNewlabel=(label==5000 && x<0)? 6000:label;//exit darcy law
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabel);
+func TestNewlabel2=(label==5000 && x>=0)? 7000:label;//entrance darcy law
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabel2);*/
+
+fespace PhFLoc(ThFLoc, P0);
+fespace PhScafLoc(ThScafLoc, P0);
+
+real[int] partFLoc(PhFLoc.ndof);
+real[int] partScafLoc(PhScafLoc.ndof);
+
+if(mpirank == 0) {
+	   partitionerSeq(partFLoc, ThFLoc, mpisize);
+           partitionerSeq(partScafLoc, ThScafLoc, mpisize);
+}
+
+partitionerPar(partFLoc, ThGlCond, mpiCommWorld, mpisize); //ThGlCond?
+partitionerPar(partScafLoc, ThGlNoCond, mpiCommWorld, mpisize);
+
+for[i, v : partFLoc]   part[new2oldF[i]] = v;
+for[i, v : partScafLoc] part[new2oldS[i]] = v;
+
+}
+
+macro ThUserPartitioning()part// EOM
+buildDmesh(Th)
+
+{
+macro def(u)[u, u#B, u#C, u#D,u#E,u#F,u#G,u#H,u#I,u#J]//
+macro init(u)[u, u, u, u,u, u, u, u,u, u]//
+macro ThPostProcessD(D) {
+    XhScaffoldUnknowns def(u), def(v);
+    varf onG(def(u), def(v)) = on(-111111, u = 10 + x - z, uB = 100 + y - x, uC = 1000 + z - y);
+    v[] = D;
+    u[] = onG(0, XhScaffoldUnknowns);
+    for [j, dj : u[]] dj = abs(dj) > 1e-2 ? 0.0 : 1.0;
+    def(u) = [u, uB, uC, vD,vE,vF,vG,vH,vI,vJ];
+    D = u[];
+}// EOM
+createMat(Th, A, Pk);
+}
+
+{
+macro def(i)[i,i#B,i#C,i#D]//
+macro init(i)[i,i,i,i]//
+createMat(Th, D, Uk)
+
+}
+}
+
+
+fespace Ph(Th, P0);
+int[int] n2oF;
+int[int] n2oS;
+
+
+Ph Cond=z>=1.8?2:0;
+mesh3 ThFLoc = trunc(Th,abs(Cond)>=1e-6,new2old = n2oF);
+mesh3 ThScafLoc = trunc(Th,abs(Cond)<=1e-6, new2old = n2oS);
+
+// ** Flow domain ** //
+
+func TestNewlabelf= (z<=1.800001)? 4000:label;
+ThFLoc=change(ThFLoc,flabel=TestNewlabelf);
+
+// ** Scaffold domain ** //
+
+func TestNewlabelwall= (label==3000)? 8000:label;
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabelwall);
+func TestNewlabell= (z>=1.79999 && label!=8000)? 5000:label;
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabell);
+/*func TestNewlabel=(label==5000 && x<0)? 6000:label;
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabel);
+func TestNewlabel2=(label==5000 && x>=0)? 7000:label;
+ThScafLoc=change(ThScafLoc,flabel=TestNewlabel2);*/
+
+fespace XhScaffoldUnknowns(Th, Pk);
+fespace XhScaffoldUnknownsLoc(ThScafLoc, Pk);
+fespace UhFlowUnknowns(Th, Uk);
+fespace UhFlowUnknownsLoc(ThFLoc, Uk);
+
+matrix RS,RF;
+int[int] restCondS = restrict(XhScaffoldUnknownsLoc,XhScaffoldUnknowns, n2oS);
+int[int] restCondF = restrict(UhFlowUnknownsLoc,UhFlowUnknowns, n2oF);
+{
+    int[int] IS = 0:restCondS.n - 1;
+    real[int] CS(IS.n);
+    CS = 1;
+    RS = [IS, restCondS, CS];
+    RS.resize(XhScaffoldUnknownsLoc.ndof, XhScaffoldUnknowns.ndof);
+}
+Mat GlobScaf(A, restriction = RS);
+
+{
+    int[int] IF = 0:restCondF.n - 1;
+    real[int] CF(IF.n);
+    CF = 1;
+    RF = [IF, restCondF, CF];
+    RF.resize(UhFlowUnknownsLoc.ndof, UhFlowUnknowns.ndof);
+}
+
+Mat GlobFlow(D, restriction = RF);
+
+fespace Xh0Loc(ThScafLoc,P0);
+Xh0Loc h = hTriangle; //for penalty terms
+fespace Xh0FLoc(ThFLoc,P0);
+Xh0FLoc hF = hTriangle; //for penalty terms
+ 
+UhFlowUnknownsLoc [uxS, uyS, uzS,pS], [vxS, vyS, vzS,qS]; //unknowns and test flow fcts 
+UhFlowUnknownsLoc [uxSold, uySold, uzSold,pSold]; //oldvalues
+
+XhScaffoldUnknownsLoc [u1d, u2d,u3d, pd,eta1,eta2,eta3,eta1t,eta2t,eta3t],[v1d, v2d,v3d, qd,eta1h,eta2h,eta3h,eta1th,eta2th,eta3th]; //scaffolds unkowns/test fcts
+XhScaffoldUnknownsLoc [u1dold , u2dold , u3dold, pdold , eta1old , eta2old , eta3old,eta1told,eta2told,eta3told]; //old values
+
+// ******************************************************* //
+// ** Matrice A:definition of matrices for porous media ** //
+// ****************************************************** //
+
+varf varfMassEtat([u1d, u2d,u3d, pd,eta1,eta2,eta3,eta1t,eta2t,eta3t],[v1d, v2d,v3d, qd,eta1h,eta2h,eta3h,eta1th,eta2th,eta3th]) =  int3d(ThScafLoc)((rhop/dt)* [eta1t,eta2t,eta3t]'*[eta1h,eta2h,eta3h])+  int3d(ThScafLoc)(rhop* [eta1t,eta2t,eta3t]'*[eta1th,eta2th,eta3th]
+     		   )-  int3d(ThScafLoc)(
+     		   [eta1,eta2,eta3]'*[eta1th,eta2th,eta3th]
+     		   )+int3d(ThScafLoc)( 
+   	 lambdap*Div(eta1,eta2,eta3) * Div(eta1h,eta2h,eta3h)      
+   	 +2.*Mup*( ee(eta1,eta2,eta3) '* ee(eta1h,eta2h,eta3h)))
+	  - int3d(ThScafLoc)(alpha*Div(eta1h,eta2h,eta3h)*pd)
+	  +int3d(ThScafLoc)( Mu/K*(u1d*v1d + u2d*v2d+ u3d*v3d)  
+            - pd*dx(v1d) - pd*dy(v2d) - pd* dz(v3d))
+	    +int3d(ThScafLoc)(c0*pd*qd/dt) 
+   	 + int3d(ThScafLoc)(Div(u1d,u2d,u3d)      *qd)
+   	 + int3d(ThScafLoc)(alpha/dt * Div(eta1,eta2,eta3) * qd)
+   	 +int2d(ThScafLoc,5000)(gammastab*Mu/h*((-u3d-eta3/dt)*(-v3d-eta3h)))
+   	 + int2d(ThScafLoc,5000)((alphaBJS/dt*(-eta1*(-eta1h) - eta2*(-eta2h)))) 
+   	//Dirichlet conditions
+         + on(8000,u1d=0,u2d=0,u3d=0) //walls
+  	 + on(8000,eta1=0,eta2=0,eta3=0) //pas de deplacement 
+   	 + on(8000,pd=0) 
+  	 ;
+
+GlobScaf=varfMassEtat(XhScaffoldUnknownsLoc,XhScaffoldUnknownsLoc,tgv=tgv); 
+//ObjectView(GlobScaf, format = "info");
+// ******************************************************** //
+// ** definition of matrices for flow   : matrice D      ** //
+// ********************************************************//
+
+varf varfK([uxS, uyS, uzS, pS],[vxS, vyS, vzS, qS])= int3d(ThFLoc)(Mu*(
+   			  Grad(uxS)      ' * Grad(vxS)   
+   			+ Grad(uyS)      ' * Grad(vyS)   
+   			+ Grad(uzS)      ' * Grad(vzS)   
+   			))
+			+int3d(ThFLoc)(rhof/dt*[uxS, uyS, uzS]'*[vxS, vyS, vzS])
+			+int3d(ThFLoc)(- pS * Div(vxS, vyS, vzS)       
+   		- Div(uxS, uyS, uzS) * qS)
+     	     + int2d(ThFLoc,Bottom)( (2*Mu*dz(uzS)-pS)*(vzS)) //balance of stress
+         	+  int2d(ThFLoc,Bottom)((2*Mu*dz(vzS)+qS)*(uzS)) // Symmetry
+	 +  int2d(ThFLoc,Bottom)(gammastab*Mu/hF*((uzS*vzS))) //mass conservation
+   	 + int2d(ThFLoc,Bottom)((alphaBJS*(uxS*vxS + uyS*vyS))) //Beavers eq.
+	 //Dirichlet conditions
+	 + on(Inlet, uxS=0., uyS=0.) 
+  	 + on(Wall, uxS=0., uyS=0., uzS=0.)
+   	;
+
+//Convert varf forms into matrices
+GlobFlow=varfK(UhFlowUnknownsLoc,UhFlowUnknownsLoc,tgv=tgv);
+
+////////////////////////////////////////////////
+//// ** Assembling global matrix :  B et C  **//
+////////////////////////////////////////////////
+
+//** B **/
+varf varfCoupledTermsFlowinScaf([uxS,uyS,uzS,pS],[v1d, v2d,v3d, qd,eta1h,eta2h,eta3h,eta1th,eta2th,eta3th])= -int2d(ThScafLoc,5000)((2*Mu*dz(uzS)-pS)*(v3d+eta3h)) 
+	   + int2d(ThScafLoc,5000)(gammastab*Mu/h*(uzS*(-v3d-eta3h))) // mass conservation
+	   + int2d(ThScafLoc,5000)(alphaBJS*(uxS*(-eta1h) + uyS*(-eta2h))) ;//Beavers eq.
+
+
+varf vonBorder([u1d, u2d,u3d, pd,eta1,eta2,eta3,eta1t,eta2t,eta3t], [v1d, v2d,v3d, qd,eta1h,eta2h,eta3h,eta1th,eta2th,eta3th]) = 
+	 //Dirichlet conditions
+          on(8000,u1d=1,u2d=1,u3d=1) //walls
+  	 + on(8000,eta1=1,eta2=1,eta3=1) //pas de deplacement 
+   	 + on(8000,pd=1) ;
+
+
+real[int] onBorder = vonBorder(0, XhScaffoldUnknownsLoc, tgv=-10);
+real[int] onBorderPETSc;
+ChangeNumbering(GlobScaf, onBorder, onBorderPETSc);
+  
+
+matrix LocB = varfCoupledTermsFlowinScaf(UhFlowUnknownsLoc,XhScaffoldUnknownsLoc);
+Mat MatCoupledFlowinScaf(GlobScaf,GlobFlow, LocB);
+Mat MatCoupledFlowinScafInterp;
+MatCoupledFlowinScafInterp =MatCoupledFlowinScaf;
+
+MatZeroRows(MatCoupledFlowinScafInterp, onBorderPETSc);
+
+
+//** C **/
+varf varfCoupledScaffoldinFlow([u1d, u2d,u3d, pd,eta1,eta2,eta3,eta1t,eta2t,eta3t],[vxS, vyS, vzS, qS])=  int2d(ThFLoc,Bottom)((2*Mu*dz(vzS)+qS)*(-u3d-1./dt*eta3)) //symmetry
+	 + int2d(ThFLoc,Bottom)(gammastab*Mu/hF*(-u3d-1./dt*eta3)*(vzS)) // mass conservation
+	 + int2d(ThFLoc,Bottom)((alphaBJS*1./dt*(-eta1*vxS - eta2*vyS)));
+
+varf vonBorderF([uxS, uyS, uzS, pS],[vxS, vyS, vzS, qS]) = 
+//Dirichlet conditions
+	    on(Inlet, uxS=1., uyS=1.) 
+	    + on(Wall, uxS=1., uyS=1., uzS=1.);
+	 
+real[int] onBorder2 = vonBorderF(0, UhFlowUnknownsLoc, tgv=-10);
+real[int] onBorderPETSc2;
+ChangeNumbering(GlobFlow, onBorder2, onBorderPETSc2);
+
+
+
+Mat MatCoupledScaffoldinFlowInterp;
+matrix LocC = varfCoupledScaffoldinFlow(XhScaffoldUnknownsLoc,UhFlowUnknownsLoc);//meme nbre de colonnes que GlobScaf et meme nbre de lignes que GlobFlow
+Mat MatCoupledScaffoldinFlow(GlobFlow,GlobScaf,LocC);//meme nbre de lignes que GlobScaf et meme nbre de colonnes que GlobFlow
+
+MatCoupledScaffoldinFlowInterp=MatCoupledScaffoldinFlow;
+
+MatZeroRows(MatCoupledScaffoldinFlowInterp, onBorderPETSc2);
+
+
+//** Assembling **//
+Mat Glob=[[GlobScaf,MatCoupledFlowinScafInterp],[MatCoupledScaffoldinFlowInterp,GlobFlow]];
+set(Glob,sparams="-ksp_view_final_residual -pc_type lu");//
+
+//////////////////////////////////////////////////////////////////////////////////////
+//******************************  LAUNCH SIMULATIONS *******************************//
+//////////////////////////////////////////////////////////////////////////////////////
+varf Matmat([u1d, u2d,u3d, pd,eta1,eta2,eta3,eta1t,eta2t,eta3t],[v1d, v2d,v3d, qd,eta1h,eta2h,eta3h,eta1th,eta2th,eta3th]) =  int3d(ThScafLoc)(
+     		  rhop/dt* [eta1told,eta2told,eta3told]'*[eta1h,eta2h,eta3h]+
+		   rhop/dt* [eta1old,eta2old,eta3old]'*[eta1th,eta2th,eta3th])
+		   +   int3d(ThScafLoc)(c0*pdold*qd/dt)
+     		   + int3d(ThScafLoc)( alpha/dt * Div(eta1old,eta2old,eta3old) * qd )
+		   +  int2d(ThScafLoc,5000)(gammastab/dt*Mu/h*((-eta3old)*(-v3d-eta3h))) // 
+   	 + int2d(ThScafLoc,5000)((alphaBJS/dt*(-eta1old*(-eta1h) - eta2old*(-eta2h)))) 
+	 	  + on(8000,u1d=0,u2d=0,u3d=0) //walls
+  	   + on(8000,eta1=0,eta2=0,eta3=0) //pas de deplacement 
+   	   + on(8000,pd=0) 
+     		   ;
+
+real[int] SndMembre=Matmat(0,XhScaffoldUnknownsLoc,tgv=tgv);
+
+//old terms
+varf varfCoupledoldTermsFlowFlow([uxS, uyS, uzS, pS],[vxS, vyS, vzS, qS])=
+      int2d(ThFLoc,Bottom)(gammastab*Mu/hF*(-1./dt*eta3old)*(vzS)) //mass conservation
+     + int2d(ThFLoc,Bottom)((2*Mu*dz(vzS)+qS)*(-1./dt*eta3old)) //symmetry
+     + int2d(ThFLoc,Bottom)((alphaBJS*1./dt*(-eta1old*vxS - eta2old*vyS))) //Beavers eq.
+     //Dirichlet conditions
+     - int2d(ThFLoc,Inlet)(2e6*sin(pi*t)*vzS)
+     +int3d(ThFLoc)(rhof/dt*[uxSold, uySold, uzSold]'*[vxS, vyS, vzS])
+     + on(Inlet, uxS=0., uyS=0.)
+     + on(Wall, uxS=0., uyS=0., uzS=0.);
+     
+XhScaffoldUnknowns [u1dG, u2dG,u3dG, pdG,eta1G,eta2G,eta3G,eta1tG,eta2tG,eta3tG];
+
+for(int i=0;i<=30;i++){
+	cout<<i<<endl;
+	t+=dt;
+	uxSold[]=uxS[];//old values in flow domai  	
+   	u1dold[]=u1d[]; //update in the scaffold
+   
+	SndMembre=Matmat(0,XhScaffoldUnknownsLoc,tgv=tgv);
+
+	real[int] SndMemberFlow= varfCoupledoldTermsFlowFlow(0,UhFlowUnknownsLoc,tgv =tgv );
+	
+	real[int] GlobSndMembre=[SndMembre,SndMemberFlow];//assembling
+
+	//solving system...
+	real[int] Solution= Glob^-1*GlobSndMembre;
+	u1d[]=Solution(0:XhScaffoldUnknownsLoc.ndof-1);
+	uxS[]=Solution(XhScaffoldUnknownsLoc.ndof:Solution.n-1);
+
+	// restricted to global restricted...
+	
+	u1dG[](restCondS)=u1d[];
+	
+	{
+    	fespace XhScaffoldUnknownsGlobal(ThGlobal, Pk);
+    	real[int] tmpS;
+    	ChangeNumbering(A, u1dG[], tmpS, exchange = false);
+    	ChangeNumbering(A, u1dG[], tmpS, inverse = true, exchange = false); // remove duplicated unknowns on the overlap
+	
+	int[int] rest = restrict(XhScaffoldUnknowns, XhScaffoldUnknownsGlobal, n2oGlobal);
+    	XhScaffoldUnknownsGlobal [u1dGlobal, u2dGlobal,u3dGlobal, pdGlobal,eta1Global,eta2Global,eta3Global,eta1tGlobal,eta2tGlobal,eta3tGlobal];
+	tmpS.resize(u1dGlobal[].n);
+    	tmpS = 0;
+    	tmpS(rest) = u1dG[];
+    	u1dGlobal[] = 0.0;
+    	mpiAllReduce(tmpS, u1dGlobal[], mpiCommWorld, mpiSUM); // reduce the solution
+	   if(mpirank == 0) {
+
+	   	      fespace PhGlobal(ThGlobal, P0);
+		      int[int] n2oF;
+		      int[int] n2oS;
+
+		      PhGlobal Cond=z>=1.8?2:0;
+		      mesh3 ThFGlob = trunc(ThGlobal,abs(Cond)>=1e-6,new2old = n2oF);
+		      mesh3 ThScafGlob = trunc(ThGlobal,abs(Cond)<=1e-6, new2old = n2oS);
+
+
+		      fespace XhScaffoldUnknownsGlobalRestreint(ThScafGlob, Pk);
+        	      int[int] restCondS = restrict(XhScaffoldUnknownsGlobalRestreint, XhScaffoldUnknownsGlobal, n2oS);
+        	      XhScaffoldUnknownsGlobalRestreint [u1dGlobalR, u2dGlobalR,u3dGlobalR, pdGlobalR,eta1GlobalR,eta2GlobalR,eta3GlobalR,eta1tGlobalR,eta2tGlobalR,eta3tGlobalR];
+		      
+        	      u1dGlobalR[] = u1dGlobal[](restCondS);
+
+		     savevtk("FirstFluxBBBnewtest.vtu",ThScafGlob,[u1dGlobalR,u2dGlobalR,u3dGlobalR],order=Order,append=true,communicator = mpiCommSelf); //flux du fluide sur l'interface
+		     savevtk("FirstDeformBBBnewtest.vtu",ThScafGlob,[eta1GlobalR,eta2GlobalR,eta3GlobalR],order=Order,append=true,communicator = mpiCommSelf); //flux du fluide sur l'interface
+        }
+
+}
+   savevtk("FirstCouplingBBBnewtest.vtu",ThFLoc,[uxS,uyS,uzS],order=Order,append=true); //flux du fluide sur l'interface
+}
+	
+
+
+
