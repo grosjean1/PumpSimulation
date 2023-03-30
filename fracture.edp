@@ -1,0 +1,284 @@
+// Elise Grosjean
+//01/2023
+// Pump simulation: stokes-Biot coupling. Method as in "Partitioning strategies for the interaction of a fluid with a poroelastic material based on a Nitsche’s coupling approach".
+//2d fracture example 
+
+load "iovtk"
+
+load "Element_Mixte"
+real tgv=1e32;
+
+real sqrt2=sqrt(2);
+int[int] Order=[1];
+
+macro Grad(u) [dx(u), dy(u)]    //
+macro Div(ux, uy) (dx(ux) + dy(uy))    //
+macro ee(u1,u2) [dx(u1),dy(u2),(dy(u1)+dx(u2))/sqrt2]  //
+
+
+//****************************** constants ***********************************//
+//in sec, mm, g
+
+real t=0;//time
+real dt=1; //
+
+real E =10e7;// //Young Modulus 
+real nu=0.2;// Poisson's ration
+real Mup=E/(2*(1+nu)); //lame coeff = shear coefficient
+real lambdap = E*nu/((1+nu)*(1-2*nu)); //lame 2nd coefficient
+
+
+//real Mup=3.84e9;
+//real lambdap = 5.76e9;
+
+real rhof=1;
+real rhop=1;
+real Mu = 1e-6;
+
+real[int,int] K=[[200e-12,0],[0,50e-12]];
+real[int,int] Kin=1./(200*50e-24)*[[50e-12,0],[0,200e-12]];
+real c0=6.89e-2;
+real alpha=1;
+//real alphaBJS=alpha*Mu/sqrt(K);//beavers-Joseph-Saffman
+real gammastab=2500;// penalization.
+
+
+//****************************** Domain ***********************************//
+
+
+border a(t=-0.05, 0.05){x=-sqrt(200*(0.05-t)*(0.05+t)) ; y=t;label=100;}; //bottom: Gamma_a
+border b(t=-0.05, 0.05){x=sqrt(200*(0.05-t)*(0.05+t)) ; y=t;label=20;}; //bottom: Gamma_a
+border c(t=-0.05, -1){x=0; y=t;label=30;}; //bottom: Gamma_a
+border d(t=0,1){x=t; y=-1;label=40;}; //bottom: Gamma_a
+border e(t=-1,1){x=1; y=t;label=50;}; //bottom: Gamma_a
+border f(t=1,0){x=t; y=1;label=60;}; //bottom: Gamma_a
+border g(t=1,0.05){x=0; y=t;label=70;}; //bottom: Gamma_a
+
+
+mesh Th = buildmesh(a(-1000) + b(10)+c(50)+d(100)+e(100)+f(100)+g(50));//frac
+
+int[int] ffLabelsTh=labels(Th);
+cout<<"labels : "<<ffLabelsTh<<endl;
+
+
+//cout <<ThSbis(0.01,0.01).region<<endl;//region=5!
+//cout <<ThSbis(0.8,0.01).region<<endl;
+Th=adaptmesh(Th,0.02,IsMetric=1,nbvx=30000);
+int[int] new2oldF;
+Th=trunc(Th,x>=0.,new2old = new2oldF);
+
+int[int] ffLabelsThtr=labels(Th);
+cout<<"labels : "<<ffLabelsThtr<<endl;
+plot(Th,cmm="maillage avant transf",wait=1);
+
+
+Th=movemesh(Th,[x,5*cos((x+y)/100)*cos((pi*x+y)/100)^2+y/2-x/10]);
+
+plot(Th,cmm="maillage ap transf",wait=1);
+
+
+mesh ThF=trunc(Th,Th(x,y).region==5,new2old = new2oldF);
+//int[int] r1=[0,80];
+//func TestNewlabel=(x==0 & -0.05<=y<=0.05)? 80:label;//exit darcy law
+//ThF=change(ThF,flabel=TestNewlabel);
+
+
+mesh ThScaf=trunc(Th,Th(x,y).region==0,new2old = new2oldF);
+
+plot(ThScaf,cmm="maillage scaf",wait=1);
+plot(ThF,cmm="maillage flow",wait=1);
+
+int[int] ffLabelsScaf=labels(ThScaf);
+int[int] ffLabelsFlow=labels(ThF);
+
+cout<<"labels Scaf: "<<ffLabelsScaf<<endl;
+cout<<"labels Flow: "<<ffLabelsFlow<<endl;
+
+fespace Xh0(ThScaf,P0);
+Xh0 h = hTriangle; //for penalty terms
+
+func Xk=[P2,P2,P1,P2,P2];
+func Uk=[P2,P2,P1];
+
+fespace XhScaffoldUnknowns(ThScaf,Xk); //for porous media (flux/pressure/displacement)
+
+fespace Xh0F(ThF,P0);
+Xh0F hF = hTriangle; //for penalty terms
+
+fespace UhFlowUnknowns(ThF,Uk);
+
+UhFlowUnknowns [uxS, uyS,pS]; //velocity-pressure stokes: unknowns and test functions
+UhFlowUnknowns [vxS, vyS,qS]; //test fcts 
+UhFlowUnknowns [uxSold, uySold, pSold]; //oldvalues
+
+XhScaffoldUnknowns [u1d, u2d, pd,eta1,eta2],[v1d, v2d, qd,eta1h,eta2h]; //scaffolds unkowns/test fcts
+XhScaffoldUnknowns [u1dold , u2dold , pdold , eta1old , eta2old]; //old values
+
+// ********************************************* //
+// ** definition of matrix for porous media  ** //
+// ********************************************* //
+
+varf varfMassEtat([u1d, u2d, pd,eta1,eta2],[v1d, v2d,qd,eta1h,eta2h]) =
+     	int2d(ThScaf)( 
+   	 lambdap*Div(eta1,eta2) * Div(eta1h,eta2h)      
+   	 +2.*Mup*( ee(eta1,eta2) '* ee(eta1h,eta2h)))
+	  - int2d(ThScaf)(alpha*Div(eta1h,eta2h)*pd)
+	  + int2d(ThScaf)( Mu/(200*50e-24)*[50e-12*u1d,200e-12*u2d]'*[v1d,v2d] 
+          - pd*dx(v1d) - pd*dy(v2d))
+	   + int2d(ThScaf)(c0*pd*qd/dt) 
+   	 + int2d(ThScaf)(Div(u1d,u2d) *qd)
+   	 + int2d(ThScaf)(alpha/dt * Div(eta1,eta2) * qd)
+	 
+   	 + int1d(ThScaf,20)(gammastab*Mu/h*(([u1d,u2d]'*[N.x,N.y]*[eta1h,eta2h]'*[N.x,N.y])))
+	 + int1d(ThScaf,20)(gammastab*Mu/h*(1./dt*[eta1,eta2]'*[N.x,N.y]*[eta1h,eta2h]'*[N.x,N.y]))
+	 + int1d(ThScaf,20)(gammastab*Mu/h*(([u1d,u2d]'*[N.x,N.y]*[v1d,v2d]'*[N.x,N.y])))
+	 + int1d(ThScaf,20)(gammastab*Mu/h*(1./dt*[eta1,eta2]'*[N.x,N.y]*[v1d,v2d]'*[N.x,N.y]))
+	 
+
+   	 + int1d(ThScaf,20)((alpha*Mu/sqrt((200*(N.y)^2+50*(N.x)^2)*1e-12))/dt*([eta1,eta2]'*[-N.y,N.x]*[eta1h,eta2h]'*[-N.y,N.x])) //Beavers equation
+	 
+   	//Dirichlet conditions
+	 + int1d(ThScaf,30,70)(pd*([v1d,v2d]'*[N.x,N.y]+alpha*[eta1h,eta2h]'*[N.x,N.y]))
+	 + int1d(ThScaf,2,10)(pd*(v1d+alpha*eta1h))
+
+	 + on(30,70,u1d=0) //walls
+	 + on(50,eta1=0)
+  	 + on(40,60,eta2=0) //pas de deplacement 
+   	 + on(40,50,60,pd=0) 
+  	 ;
+  
+
+//convert varf forms to matrices...
+matrix MatMassEtat=varfMassEtat(XhScaffoldUnknowns,XhScaffoldUnknowns); 
+
+
+//Assembling...
+/* Equation 1 */
+matrix GlobScaf=MatMassEtat;//Ms
+set(GlobScaf,solver=UMFPACK);
+
+
+// ********************************************* //
+// ** definition of matrix for flow         ** //
+// ********************************************* /
+
+
+varf varfK([uxS, uyS, pS],[vxS, vyS, qS])=
+     		      int2d(ThF)(Mu*(
+   			  Grad(uxS)      ' * Grad(vxS)   
+   			+ Grad(uyS)      ' * Grad(vyS)   
+   			))
+		
+			-int2d(ThF)( pS * Div(vxS, vyS)
+   		- Div(uxS, uyS) * qS)
+		//+int2d(ThF)(0.01*hF^2* Grad(pS)'* Grad(qS))      
+
+		-int1d(ThF,20)(([N.x,N.y]'*[[2*Mu*dx(uxS)-pS,Mu*(dy(uxS)+dx(uyS))],[Mu*(dy(uxS)+dx(uyS)),2*Mu*dy(uyS)-pS]]'*[N.x,N.y]*[vxS,vyS]'*[N.x,N.y])) //balance of stress
+	 
+		- int1d(ThF,20)(([N.x,N.y]'*[[2*Mu*dx(vxS)+qS,Mu*(dy(vxS)+dx(vyS))],[Mu*(dy(vxS)+dx(vyS)),2*Mu*dy(vyS)+qS]]'*[N.x,N.y]*[uxS,uyS]'*[N.x,N.y])) // Symmetry
+	 
+		+ int1d(ThF,20)(gammastab*Mu/hF*(([uxS,uyS]'*[N.x,N.y]*[vxS,vyS]'*[N.x,N.y]))) //mass conservation
+   	 	+ int1d(ThF,20)((alpha*Mu/sqrt((200*(N.y)^2+50*(N.x)^2)*1e-12))*([uxS,uyS]'*[-N.y,N.x]*[vxS,vyS]'*[-N.y,N.x])) //Beavers eq.
+
+	 	//Dirichlet conditions
+   	 	+ on(2,uxS=10,uyS=0)
+   	;
+
+//Convert varf forms into matrices
+
+matrix GlobFlow=varfK(UhFlowUnknowns,UhFlowUnknowns,tgv=tgv);
+set(GlobFlow,solver=UMFPACK,tgv=tgv);
+
+
+//scaffold unknowns with flow test functions
+ varf varfCoupledScaffoldinFlow([u1d, u2d, pd,eta1,eta2],[vxS, vyS, qS])=
+	   int1d(ThF,20)(([N.x,N.y]'*[[2*Mu*dx(vxS)+qS,Mu*(dy(vxS)+dx(vyS))],[Mu*(dy(vxS)+dx(vyS)),2*Mu*dy(vyS)+qS]]'*[N.x,N.y]*([u1d,u2d]'*[N.x,N.y]+1./dt*[eta1,eta2]'*[N.x,N.y])))
+	 
+	 - int1d(ThF,20)(gammastab*Mu/hF*([u1d,u2d]'*[N.x,N.y]+1./dt*[eta1,eta2]'*[N.x,N.y])*([vxS,vyS]'*[N.x,N.y])) // mass conservation
+	 - int1d(ThF,20)((alpha*Mu/sqrt((200*(N.y)^2+50*(N.x)^2)*1e-12))*1./dt*([eta1,eta2]'*[-N.y,N.x]*[vxS,vyS]'*[-N.y,N.x] ))
+	 ;
+ 
+   
+varf varfCoupledTermsFlowinScaf([uxS, uyS, pS],[v1d, v2d, qd,eta1h,eta2h])=
+ 	   
+	   - int1d(ThScaf,20)(([N.x,N.y]'*[[2*Mu*dx(uxS)-pS,Mu*(dy(uxS)+dx(uyS))],[Mu*(dy(uxS)+dx(uyS)),2*Mu*dy(uyS)-pS]]'*[N.x,N.y]*([v1d,v2d]'*[N.x,N.y]+[eta1h,eta2h]'*[N.x,N.y]))) //sigma_f: balance of stresses 
+	   - int1d(ThScaf,20)(gammastab*Mu/h*([uxS,uyS]'*[N.x,N.y]*([v1d,v2d]'*[N.x,N.y]+[eta1h,eta2h]'*[N.x,N.y]))) // mass conservation
+	   - int1d(ThScaf,20)((alpha*Mu/sqrt((200*(N.y)^2+50*(N.x)^2)*1e-12))*([uxS,uyS]'*[-N.y,N.x]*([eta1h,eta2h]'*[-N.y,N.x]))) //Beavers eq.
+  	 ;
+
+
+
+matrix MatCoupledFlowinScaf=varfCoupledTermsFlowinScaf(UhFlowUnknowns,XhScaffoldUnknowns);//Def on the same domain ... 
+matrix MatCoupledTermsFlowinScafInterp=MatCoupledFlowinScaf;
+
+matrix MatCoupledScaffoldinFlow=varfCoupledScaffoldinFlow(XhScaffoldUnknowns,UhFlowUnknowns); //Def on the same mesh... 
+matrix MatCoupledScaffoldinFlowInterp=MatCoupledScaffoldinFlow;
+
+
+// ** Assembling global matrix **//
+matrix Glob=[[GlobScaf,MatCoupledTermsFlowinScafInterp],[MatCoupledScaffoldinFlowInterp,GlobFlow]];
+
+set(Glob,solver=UMFPACK,tgv=tgv);
+
+//////////////////////////////////////////////////////////////////////////////////////
+//******************************  LAUNCH SIMULATIONS *******************************//
+//////////////////////////////////////////////////////////////////////////////////////
+//init: flow at rest
+t=0;
+uxS[]=0;
+uxSold[]=0;
+pS[]=0;
+
+varf Matmat([u1d, u2d, pd,eta1,eta2],[v1d, v2d, qd,eta1h,eta2h]) = 
+     		     int2d(ThScaf)(c0*pdold*qd/dt)
+     		   + int2d(ThScaf)( alpha/dt * Div(eta1old,eta2old) * qd )
+
+	 + int1d(ThScaf,20)(gammastab/dt*Mu/h*(([eta1old,eta2old]'*[N.x,N.y])*([v1d,v2d]'*[N.x,N.y]-[eta1h,eta2h]'*[N.x,N.y]))) // 
+   	 + int1d(ThScaf,20)((alpha*Mu/sqrt((200*(N.y)^2+50*(N.x)^2)*1e-12))/dt*([eta1old,eta2old]'*[-N.y,N.x]*([eta1h,eta2h]'*[-N.y,N.x])))
+	     + on(30,70,u1d=0) //walls
+	 + on(50,eta1=0)
+  	 + on(40,60,eta2=0) //pas de deplacement 
+   	 + on(40,50,60,pd=0)
+	 
+	 ;
+
+//old terms
+varf varfCoupledoldTermsFlowFlow([uxS, uyS, pS],[vxS, vyS,  qS])=
+      int1d(ThF,20)(gammastab*Mu/hF*(-1./dt*[eta1old,eta2old]'*[N.x,N.y])*([vxS,vyS]'*[N.x,N.y])) //mass conservation
+    
+       + int1d(ThF,20)(([N.x,N.y]'*[[2*Mu*dx(vxS)+qS,Mu*(dy(vxS)+dx(vyS))],[Mu*(dy(vxS)+dx(vyS)),2*Mu*dy(vyS)+qS]]'*[N.x,N.y]*([u1d,u2d]'*[N.x,N.y]+1./dt*[eta1old,eta2old]'*[N.x,N.y]))) //symmetry
+       	 - int1d(ThF,20)((alpha*Mu/sqrt((200*(N.y)^2+50*(N.x)^2)*1e-12))*1./dt*([eta1old,eta2old]'*[-N.y,N.x]*[vxS,vyS]'*[-N.y,N.x] )) //Beavers eq
+     //Dirichlet conditions
+     + on(2,uxS=10,uyS=0) 
+   ;
+     
+real[int] SndMembre= Matmat(0,XhScaffoldUnknowns,tgv =tgv );
+real[int] SndMemberFlow= varfCoupledoldTermsFlowFlow(0,UhFlowUnknowns,tgv =tgv );
+real[int] GlobSndMembre=[SndMembre,SndMemberFlow];
+
+//[u1d, u2d, pd,eta1,eta2]=[0,0,1000,0,0];
+
+for(int i=0;i<300;i++){
+	cout<<i<<endl;
+	t+=dt;
+  	uxSold[]=uxS[];
+   	u1dold[]= u1d[];
+   	SndMembre=Matmat(0,XhScaffoldUnknowns,tgv=tgv);
+	SndMemberFlow= varfCoupledoldTermsFlowFlow(0,UhFlowUnknowns,tgv=tgv);
+	//uxS[]=GlobFlow^-1*SndMemberFlow;
+	GlobSndMembre=[SndMembre,SndMemberFlow];//assembling
+	
+	real[int] Solution= Glob^-1*GlobSndMembre;
+	u1d[]=Solution(0:XhScaffoldUnknowns.ndof-1);
+	uxS[]=Solution(XhScaffoldUnknowns.ndof:Solution.n-1);
+	 
+	  
+	plot([u1d,u2d],value=1,cmm="flux"+i,wait=1);
+	plot(pS,value=1,cmm="p",wait=1);
+	plot([eta1,eta2],value=1,cmm="deform"+i,wait=1);
+	plot([uxS,uyS],value=1,cmm="stokes"+i,wait=1);
+	plot(pd,value=1,cmm="stokes"+i,wait=1);
+	
+ }
+  
+ 
