@@ -21,7 +21,7 @@ macro ee(u1,u2) [dx(u1),dy(u2),(dy(u1)+dx(u2))/sqrt2]  //
 real t=0;//time
 real dt=0.1; //
 
-real E =10e3;// //Young Modulus 
+real E =10e10;// //Young Modulus 
 real nu=0.3;// Poisson's ration
 real Mup=E/(2*(1+nu)); //lame coeff = shear coefficient
 real lambdap = E*nu/((1+nu)*(1-2*nu)); //lame 2nd coefficient
@@ -38,26 +38,30 @@ real K=1;
 real Kf=10;
 real c0=1;
 real alpha=1;
-real alphaBJS=alpha*Mu/sqrt(K);//beavers-Joseph-Saffman
-real gammastab=1000;// penalization.
+real alphaBJS=0;//alpha*Mu/sqrt(K);//beavers-Joseph-Saffman
+real gammastab=500;// penalization.
 
 
 //****************************** Domain ***********************************//
 
-int[int] labsS=[5,6,7,8];
-int[int] labsS2=[9,10,11,12];
+int[int] labsF=[5,6,7,2];
+int[int] labsS2=[8,9,10,6];
 
-mesh ThScaf2 = square(50, 50, [x,y+0.1],label=labsS2);
-mesh ThScaf1 = square(50, 50, [x,y-1]);
-mesh ThF = square(50, 5, [x,0.1*y],label=labsS);
+mesh ThScaf2 = square(100, 100, [x,y]);//
+mesh ThScaf1 = square(100, 100, [x+1.1,y],label=labsS2);
+mesh ThF = square(10, 100, [x*0.1+1,y],label=labsF);
 mesh ThScaf=ThScaf2+ThScaf1;
-plot(ThScaf,wait=1);
+plot(ThScaf,ThF,wait=1);
 
 fespace PhFlowVelocityInScaffold(ThScaf,P1);//pressure velocity interpolation
 fespace Xh0(ThScaf,P0);
 Xh0 h = hTriangle; //for penalty terms
 /*
 func Xk=[P2,P2,P1,P2,P2];
+func Uk=[P2,P2,P1];
+*/
+/*
+func Xk=[RT0,P1,P2,P2];
 func Uk=[P2,P2,P1];
 */
 
@@ -67,7 +71,6 @@ func Uk=[P1,P1,P1];
 
 
 fespace XhScaffoldUnknowns(ThScaf,Xk); //for porous media (flux/pressure/displacement)
-
 fespace Xh0F(ThF,P0);
 Xh0F hF = hTriangle; //for penalty terms
 int[int] labF=labels(ThF);
@@ -90,19 +93,20 @@ varf varfMassEtat([u1d, u2d, pd,eta1,eta2],[v1d, v2d,qd,eta1h,eta2h]) =
    	 +2.*Mup*( ee(eta1,eta2) '* ee(eta1h,eta2h)))
 	  - int2d(ThScaf)(alpha*Div(eta1h,eta2h)*pd)
 	  + int2d(ThScaf)( Mu/K*(u1d*v1d + u2d*v2d)  
-          - pd*dx(v1d) - pd*dy(v2d))
+          - pd*Div(v1d,v2d))
 	   + int2d(ThScaf)(c0*pd*qd/dt) 
    	 + int2d(ThScaf)(Div(u1d,u2d) *qd)
    	 + int2d(ThScaf)(alpha/dt * Div(eta1,eta2) * qd)
 	 
-   	 + int1d(ThScaf,3,9)(gammastab*Mu/h*((-u2d-eta2/dt)*(-v2d-eta2h))) // mass conservation
-   	 + int1d(ThScaf,3,9)((alphaBJS/dt*(-eta1*(-eta1h)))) //Beavers equation
+   	 + int1d(ThScaf,2,6)(gammastab*Mu/h*((-u1d-eta1/dt)*(-v1d-eta1h))) // mass conservation
+   	 + int1d(ThScaf,2,6)((alphaBJS/dt*(-eta2*(-eta2h)))) //Beavers equation
    	//Dirichlet conditions
-	 - int1d(ThScaf,4,12)(pd*(v1d+alpha*eta1h))
-	 + int1d(ThScaf,2,10)(pd*(v1d+alpha*eta1h))
-         + on(2,4,10,12,u1d=0) //walls
-  	 + on(1,11,eta1=0,eta2=0) //pas de deplacement 
-   	 + on(1,11,pd=0) 
+
+	// - int1d(ThScaf,8,3)(pd*(v2d+alpha*eta2h))
+	 //+ int1d(ThScaf,1,10)(pd*(v2d+alpha*eta2h))
+         + on(1,8,10,3,u2d=0) //walls
+  	 + on(4,9,eta1=0,eta2=0) //pas de deplacement 
+   	 + on(4,9,pd=0) 
   	 ;
   
 
@@ -119,27 +123,30 @@ set(GlobScaf,solver=UMFPACK);
 // ********************************************* //
 // ** definition of matrix for flow         ** //
 // ********************************************* /
-
-
+func uIn=-4000*((1.1-x)*(1-x));
 varf varfK([uxS, uyS, pS],[vxS, vyS, qS])=
+     		 
      		      int2d(ThF)(Mu*(
    			  Grad(uxS)      ' * Grad(vxS)   
    			+ Grad(uyS)      ' * Grad(vyS)   
    			))
 			+int2d(ThF)(Mu*Kf*[uxS,uyS]'*[vxS,vyS])//brinkmann eq
 			-int2d(ThF)( pS * Div(vxS, vyS)
-   		- Div(uxS, uyS) * qS)
-		+int2d(ThF)(0.01*hF^2* Grad(pS)'* Grad(qS))      
-	 + int1d(ThF,5)( (2*Mu*dy(uyS)-pS)*(vyS)) //balance of stress
-	 - int1d(ThF,7)( (2*Mu*dy(uyS)-pS)*(vyS)) //balance of stress
-      	 +  int1d(ThF,5)((2*Mu*dy(vyS)+qS)*(uyS)) // Symmetry
-	 -  int1d(ThF,7)((2*Mu*dy(vyS)+qS)*(uyS)) // Symmetry
-	 + int1d(ThF,5,7)(gammastab*Mu/hF*((uyS*vyS))) //mass conservation
-   	 + int1d(ThF,5,7)((alphaBJS*(uxS*vxS))) //Beavers eq.
+   	- Div(uxS, uyS) * qS)
+	+ int2d(ThF)(18*hF^2* Grad(pS)'* Grad(qS))
+	
+	 + int1d(ThF,2)( (2*Mu*dx(uxS)-pS)*(vxS)) //balance of stress
+	 - int1d(ThF,6)( (2*Mu*dx(uxS)-pS)*(vxS)) //balance of stress
+
+	 +  int1d(ThF,2)((2*Mu*dx(vxS)+qS)*(uxS)) // Symmetry
+	 -  int1d(ThF,6)((2*Mu*dx(vxS)+qS)*(uxS)) // Symmetry
+	 
+	 + int1d(ThF,2,6)(gammastab*Mu/hF*((uxS*vxS))) //mass conservation
+   	 + int1d(ThF,2,6)((alphaBJS*(uyS*vyS))) //Beavers eq.
 
 	 //Dirichlet conditions
-   	 + on(8,uxS=10,uyS=0)
-  	 + on(6, uxS=0., uyS=0.)
+   	 + on(5,uyS=10)//,uxS=0)
+  	 + on(7, uxS=0., uyS=0.)
    	;
 
 //Convert varf forms into matrices
@@ -150,17 +157,18 @@ set(GlobFlow,solver=UMFPACK);
 
 //scaffold unknowns with flow test functions
 varf varfCoupledScaffoldinFlow([u1d, u2d, pd,eta1,eta2],[vxS, vyS,  qS])=
-	   int1d(ThF,5)((2*Mu*dy(vyS)+qS)*(-u2d-1./dt*eta2)) //symmetry
-	 - int1d(ThF,7)((2*Mu*dy(vyS)+qS)*(-u2d-1./dt*eta2)) //symmetry  
-	 + int1d(ThF,5,7)(gammastab*Mu/hF*(-u2d-1./dt*eta2)*(vyS)) // mass conservation
-	 + int1d(ThF,5,7)((alphaBJS*1./dt*(-eta1*vxS ))); //Beavers eq
+	 -  int1d(ThF,2)((2*Mu*dx(vxS)+qS)*(u1d+1./dt*eta1)) //symmetry
+	 + int1d(ThF,6)((2*Mu*dx(vxS)+qS)*(u1d+1./dt*eta1)) //symmetry
+	 
+	 + int1d(ThF,2,6)(gammastab*Mu/hF*(-u1d-1./dt*eta1)*(vxS)) // mass conservation
+	 + int1d(ThF,2,6)((alphaBJS*1./dt*(-eta2*vyS ))); //Beavers eq
 	 
    
 varf varfCoupledTermsFlowinScaf([uxS, uyS, pS],[v1d, v2d, qd,eta1h,eta2h])=
- 	   - int1d(ThScaf,3)((2*Mu*dy(uyS)-pS)*(v2d+eta2h)) //sigma_f: balance of stresses
-	   +  int1d(ThScaf,9)((2*Mu*dy(uyS)-pS)*(v2d+eta2h)) //sigma_f: balance of stresses 
-	   + int1d(ThScaf,3,9)(gammastab*Mu/h*(uyS*(-v2d-eta2h))) // mass conservation
-	   + int1d(ThScaf,3,9)(alphaBJS*(uxS*(-eta1h) )) //Beavers eq.
+ 	   - int1d(ThScaf,2)((2*Mu*dx(uxS)-pS)*(v1d+eta1h)) //sigma_f: balance of stresses
+	   +  int1d(ThScaf,6)((2*Mu*dx(uxS)-pS)*(v1d+eta1h)) //sigma_f: balance of stresses 
+	   + int1d(ThScaf,2,6)(gammastab*Mu/h*(uxS*(-v1d-eta1h))) // mass conservation
+	   + int1d(ThScaf,2,6)(alphaBJS*(uyS*(-eta2h) )) //Beavers eq.
   	 ;
 
 
@@ -190,33 +198,34 @@ varf Matmat([u1d, u2d, pd,eta1,eta2],[v1d, v2d, qd,eta1h,eta2h]) =
      		     int2d(ThScaf)(c0*pdold*qd/dt)
      		   + int2d(ThScaf)( alpha/dt * Div(eta1old,eta2old) * qd )
 
-	 + int1d(ThScaf,3,9)(gammastab/dt*Mu/h*((-eta2old)*(-v2d-eta2h))) // 
-   	 + int1d(ThScaf,3,9)((alphaBJS/dt*(-eta1old*(-eta1h))))
+	 + int1d(ThScaf,2,6)(gammastab/dt*Mu/h*((-eta1old)*(-v1d-eta1h))) // 
+   	 + int1d(ThScaf,2,6)((alphaBJS/dt*(-eta2old*(-eta2h))))
 
-	 + on(2,4,10,12,u1d=0) //walls
-  	 + on(1,11,eta1=0,eta2=0) //pas de deplacement 
-   	 + on(1,11,pd=0)
+	 + on(1,8,10,3,u2d=0) //walls
+  	 + on(4,9,eta1=0,eta2=0) //pas de deplacement 
+   	 + on(4,9,pd=0)
 	 ;
 
 //old terms
 varf varfCoupledoldTermsFlowFlow([uxS, uyS, pS],[vxS, vyS,  qS])=
-      int1d(ThF,5,7)(gammastab*Mu/hF*(-1./dt*eta2old)*(vyS)) //mass conservation
-     + int1d(ThF,5)((2*Mu*dy(vyS)+qS)*(-1./dt*eta2old)) //symmetry
-     - int1d(ThF,7)((2*Mu*dy(vyS)+qS)*(-1./dt*eta2old)) //symmetry
-     + int1d(ThF,5,7)((alphaBJS*1./dt*(-eta1old*vxS ))) //Beavers eq.
+      int1d(ThF,2,6)(gammastab*Mu/hF*(-1./dt*eta1old)*(vxS)) //mass conservation
+     - int1d(ThF,2)((2*Mu*dy(vyS)+qS)*(-1./dt*eta1old)) //symmetry
+     + int1d(ThF,6)((2*Mu*dy(vyS)+qS)*(-1./dt*eta1old)) //symmetry
+     + int1d(ThF,2,6)((alphaBJS*1./dt*(-eta2old*vyS ))) //Beavers eq.
      
      //Dirichlet conditions
-     + on(8,uxS=10,uyS=0) 
-     + on(6, uxS=0., uyS=0.); //no flows outside the channel from the right border
+     + on(5,uyS=10)//,uxS=0) 
+     + on(7, uxS=0., uyS=0.); //no flows outside the channel from the right border
      
 real[int] SndMembre= Matmat(0,XhScaffoldUnknowns,tgv =tgv );
 real[int] SndMemberFlow= varfCoupledoldTermsFlowFlow(0,UhFlowUnknowns,tgv =tgv );
 real[int] GlobSndMembre=[SndMembre,SndMemberFlow];
 
 
-for(int i=0;i<300;i++){
+for(int i=0;i<10;i++){
 	cout<<i<<endl;
 	t+=dt;
+	
   	uxSold[]=uxS[];
    	u1dold[]= u1d[];
    	SndMembre=Matmat(0,XhScaffoldUnknowns,tgv=tgv);
@@ -227,13 +236,19 @@ for(int i=0;i<300;i++){
 	real[int] Solution= Glob^-1*GlobSndMembre;
 	u1d[]=Solution(0:XhScaffoldUnknowns.ndof-1);
 	uxS[]=Solution(XhScaffoldUnknowns.ndof:Solution.n-1);
-	   
-	  
-	plot([u1d,u2d],value=1,cmm="flux"+i,wait=1);
-	plot(pS,value=1,cmm="p",wait=1);
-	plot([eta1,eta2],value=1,cmm="deform"+i,wait=1);
-	plot([uxS,uyS],value=1,cmm="stokes"+i,wait=1);
-	plot(pd,value=1,cmm="stokes"+i,wait=1);
+	if(i==9){
+	savevtk("testoku.vtu",ThScaf,[u1d,u2d],order=Order);
+	savevtk("testokp.vtu",ThScaf,pd,order=Order);
+	savevtk("testoketa.vtu",ThScaf,[eta1,eta2],order=Order);
+	savevtk("testokuf.vtu",ThF,[uxS,uyS],order=Order);
+	savevtk("testokpf.vtu",ThF,pS,order=Order);
+	}
+
+	plot([u1d,u2d],pd,value=1,cmm="flux"+t,wait=1);
+	plot(pS,value=1,cmm="p"+t,wait=1);
+	plot([eta1,eta2],value=1,cmm="deform"+t,wait=1);
+	plot([uxS,uyS],value=1,cmm="stokes"+t,wait=1);
+	plot(pd,value=1,cmm="stokes"+t,wait=1);
 	
  }
   
